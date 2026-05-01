@@ -39,8 +39,9 @@ constexpr uint8_t  MOTOR_PWM_RES  = 8;
 
 /* ================= MOTOR POLARITY CONFIG ================= */
 
+// If one side spins the wrong way during FORWARD, flip that side's flag.
 constexpr bool LEFT_DIR_INVERT  = false;
-constexpr bool RIGHT_DIR_INVERT = false;
+constexpr bool RIGHT_DIR_INVERT = true;
 
 /* ================= STEPPER CONFIG ================= */
 
@@ -190,8 +191,13 @@ void motor_set_right(uint8_t duty, bool dir, bool brake)
 
 void drive_stop_raw()
 {
-    motor_set_left(0, true, true);
-    motor_set_right(0, true, true);
+    // Do NOT rewrite direction pins during stop.
+    // Only brake and remove PWM so the analyzer does not see a fake direction snap.
+    pin_write(LBRAKE_PIN, true);
+    pin_write(RBRAKE_PIN, true);
+
+    ledcWrite(LPWM_CH, 0);
+    ledcWrite(RPWM_CH, 0);
 }
 
 void drive_forward_raw()
