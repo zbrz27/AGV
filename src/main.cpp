@@ -4,11 +4,8 @@
 
 /* ================= CONFIG ================= */
 
-// SoftAP config
 const char* AP_SSID = "ESP32_ROBOT";
 const char* AP_PASS = "12345678";
-
-/* ================= HTTP SERVER ================= */
 
 WebServer server(80);
 
@@ -30,6 +27,9 @@ constexpr gpio_num_t RDIR_PIN   = GPIO_NUM_14;
 constexpr gpio_num_t LBRAKE_PIN = GPIO_NUM_32;
 constexpr gpio_num_t RBRAKE_PIN = GPIO_NUM_33;
 
+// Main drive power MOSFET gate
+constexpr gpio_num_t DRIVE_POWER_EN_PIN = GPIO_NUM_4;
+
 /* ================= PWM CONFIG ================= */
 
 constexpr uint8_t  LPWM_CH        = 0;
@@ -37,31 +37,40 @@ constexpr uint8_t  RPWM_CH        = 1;
 constexpr uint32_t MOTOR_PWM_FREQ = 20000;
 constexpr uint8_t  MOTOR_PWM_RES  = 8;
 
-/* ================= MOTOR POLARITY CONFIG ================= */
+/* ================= POLARITY CONFIG ================= */
 
-// If one side spins the wrong way during FORWARD, flip that side's flag.
 constexpr bool LEFT_DIR_INVERT  = false;
 constexpr bool RIGHT_DIR_INVERT = true;
+
+constexpr bool DRIVE_POWER_ACTIVE_HIGH = true;
+
+// Flipped from previous logic.
+// false means LOW = brake active, HIGH = brake released.
+constexpr bool BRAKE_ACTIVE_HIGH = false;
 
 /* ================= STEPPER CONFIG ================= */
 
 constexpr uint32_t STEPPER_PULSE_HZ = 200;
 
-// Microstep pins
 constexpr uint8_t STEP_MS1 = 0;
 constexpr uint8_t STEP_MS2 = 0;
 constexpr uint8_t STEP_MS3 = 0;
 
-/* ================= SAFETY / TIMING ================= */
+/* ================= DRIVE RAMP / SAFETY TIMING ================= */
 
-constexpr uint32_t DRIVE_DIR_CHANGE_DELAY_MS = 50;
-constexpr uint32_t WATCHDOG_TIMEOUT_MS       = 800;
+constexpr uint32_t DRIVE_DIR_CHANGE_DELAY_MS = 150;
+constexpr uint32_t DRIVE_RAMP_INTERVAL_MS    = 20;
+
+// Softer ramp to reduce startup lunge
+constexpr uint8_t DRIVE_ACCEL_STEP = 2;
+constexpr uint8_t DRIVE_DECEL_STEP = 4;
+
+constexpr uint32_t DRIVE_POWER_OFF_DELAY_MS = 150;
+constexpr uint32_t WATCHDOG_TIMEOUT_MS      = 800;
 
 /* ================= GLOBALS ================= */
 
 portMUX_TYPE stepperMux = portMUX_INITIALIZER_UNLOCKED;
-
-/* ================= STATE ENUMS ================= */
 
 enum DriveState
 {
@@ -79,24 +88,33 @@ enum StepperState
     STEPPER_CCW
 };
 
-/* ================= RUNTIME STATE ================= */
-
 volatile DriveState   drive_state   = DRIVE_IDLE;
 volatile StepperState stepper_state = STEPPER_IDLE;
 
 volatile uint8_t drive_speed_percent = 50;
 volatile uint8_t drive_duty = 20;
 
-/* ================= WATCHDOG STATE ================= */
+/* ================= DRIVE RAMP STATE ================= */
 
-volatile uint32_t lastPacketTime = 0;
-bool watchdog_tripped = false;
+DriveState commanded_drive_state = DRIVE_IDLE;
 
-/* ================= DRIVE INTERLOCK STATE ================= */
+uint8_t current_drive_duty = 0;
+uint8_t target_drive_duty = 0;
+
+uint32_t last_drive_ramp_ms = 0;
 
 bool drive_interlock_active = false;
 uint32_t drive_interlock_start_ms = 0;
 DriveState pending_drive_state = DRIVE_IDLE;
+
+bool drive_power_enabled = false;
+bool drive_power_off_pending = false;
+uint32_t drive_power_off_start_ms = 0;
+
+/* ================= WATCHDOG STATE ================= */
+
+volatile uint32_t lastPacketTime = 0;
+bool watchdog_tripped = false;
 
 /* ================= STEPPER NON-BLOCKING STATE ================= */
 
@@ -104,10 +122,10 @@ volatile bool stepper_enabled = false;
 volatile bool stepper_dir_cw  = true;
 volatile bool step_pin_state  = false;
 
-uint32_t stepper_half_period_us = 2500;   // 200 Hz -> 2500 us half-period
+uint32_t stepper_half_period_us = 2500;
 uint32_t last_step_toggle_us = 0;
 
-/* ================= LOW-LEVEL GPIO HELPERS ================= */
+/* ================= LOW-LEVEL HELPERS ================= */
 
 static inline void pin_write(gpio_num_t pin, bool value)
 {
@@ -125,6 +143,58 @@ uint8_t speed_percent_to_duty(uint8_t percent)
     return (uint8_t)((255UL * percent) / 100UL);
 }
 
+void set_brake(gpio_num_t pin, bool brake_active)
+{
+    bool level = BRAKE_ACTIVE_HIGH ? brake_active : !brake_active;
+    pin_write(pin, level);
+}
+
+void set_drive_power(bool enabled)
+{
+    bool level = DRIVE_POWER_ACTIVE_HIGH ? enabled : !enabled;
+    pin_write(DRIVE_POWER_EN_PIN, level);
+
+    drive_power_enabled = enabled;
+
+    if (enabled)
+    {
+        drive_power_off_pending = false;
+    }
+}
+
+void request_drive_power_off_delay()
+{
+    if (!drive_power_enabled)
+        return;
+
+    if (!drive_power_off_pending)
+    {
+        drive_power_off_pending = true;
+        drive_power_off_start_ms = millis();
+    }
+}
+
+void service_drive_power_off()
+{
+    if (!drive_power_off_pending)
+        return;
+
+    if (commanded_drive_state != DRIVE_IDLE || current_drive_duty != 0 || drive_interlock_active)
+    {
+        drive_power_off_pending = false;
+        return;
+    }
+
+    uint32_t now_ms = millis();
+
+    if ((uint32_t)(now_ms - drive_power_off_start_ms) >= DRIVE_POWER_OFF_DELAY_MS)
+    {
+        set_drive_power(false);
+        drive_power_off_pending = false;
+        Serial.println("DRIVE_POWER_OFF");
+    }
+}
+
 /* ================= TELEMETRY HELPERS ================= */
 
 const char* drive_state_to_str(DriveState s)
@@ -135,7 +205,6 @@ const char* drive_state_to_str(DriveState s)
         case DRIVE_BACKWARD: return "BACK";
         case DRIVE_LEFT:     return "LEFT";
         case DRIVE_RIGHT:    return "RIGHT";
-        case DRIVE_IDLE:
         default:             return "STOP";
     }
 }
@@ -146,7 +215,6 @@ const char* stepper_state_to_str(StepperState s)
     {
         case STEPPER_CW:   return "UP";
         case STEPPER_CCW:  return "DOWN";
-        case STEPPER_IDLE:
         default:           return "STOP";
     }
 }
@@ -154,16 +222,25 @@ const char* stepper_state_to_str(StepperState s)
 String build_telemetry_string()
 {
     String s;
-    s.reserve(80);
+    s.reserve(160);
 
     s += "DRIVE:";
     s += drive_state_to_str((DriveState)drive_state);
+
+    s += "|CMD:";
+    s += drive_state_to_str(commanded_drive_state);
 
     s += "|LIFT:";
     s += stepper_state_to_str((StepperState)stepper_state);
 
     s += "|SPD:";
     s += String(drive_speed_percent);
+
+    s += "|DUTY:";
+    s += String(current_drive_duty);
+
+    s += "|PWR:";
+    s += drive_power_enabled ? "ON" : "OFF";
 
     s += "|WDG_MS:";
     s += String((uint32_t)(millis() - lastPacketTime));
@@ -176,128 +253,243 @@ String build_telemetry_string()
 void motor_set_left(uint8_t duty, bool dir, bool brake)
 {
     dir = apply_dir_invert(dir, LEFT_DIR_INVERT);
+
+    set_drive_power(true);
     pin_write(LDIR_PIN, dir);
-    pin_write(LBRAKE_PIN, brake);
+    set_brake(LBRAKE_PIN, brake);
     ledcWrite(LPWM_CH, brake ? 0 : duty);
 }
 
 void motor_set_right(uint8_t duty, bool dir, bool brake)
 {
     dir = apply_dir_invert(dir, RIGHT_DIR_INVERT);
+
+    set_drive_power(true);
     pin_write(RDIR_PIN, dir);
-    pin_write(RBRAKE_PIN, brake);
+    set_brake(RBRAKE_PIN, brake);
     ledcWrite(RPWM_CH, brake ? 0 : duty);
 }
 
 void drive_stop_raw()
 {
-    // Do NOT rewrite direction pins during stop.
-    // Only brake and remove PWM so the analyzer does not see a fake direction snap.
-    pin_write(LBRAKE_PIN, true);
-    pin_write(RBRAKE_PIN, true);
-
     ledcWrite(LPWM_CH, 0);
     ledcWrite(RPWM_CH, 0);
+
+    set_brake(LBRAKE_PIN, true);
+    set_brake(RBRAKE_PIN, true);
 }
 
-void drive_forward_raw()
+void drive_forward_raw(uint8_t duty)
 {
-    motor_set_left(drive_duty, true, false);
-    motor_set_right(drive_duty, true, false);
+    motor_set_left(duty, true, false);
+    motor_set_right(duty, true, false);
 }
 
-void drive_backward_raw()
+void drive_backward_raw(uint8_t duty)
 {
-    motor_set_left(drive_duty, false, false);
-    motor_set_right(drive_duty, false, false);
+    motor_set_left(duty, false, false);
+    motor_set_right(duty, false, false);
 }
 
-void drive_left_raw()
+void drive_left_raw(uint8_t duty)
 {
-    motor_set_left(drive_duty, false, false);
-    motor_set_right(drive_duty, true, false);
+    motor_set_left(duty, false, false);
+    motor_set_right(duty, true, false);
 }
 
-void drive_right_raw()
+void drive_right_raw(uint8_t duty)
 {
-    motor_set_left(drive_duty, true, false);
-    motor_set_right(drive_duty, false, false);
+    motor_set_left(duty, true, false);
+    motor_set_right(duty, false, false);
 }
 
-void apply_drive_state_immediate(DriveState new_state)
+void apply_drive_output(DriveState state, uint8_t duty)
 {
-    drive_state = new_state;
+    drive_state = state;
 
-    switch (new_state)
+    if (state == DRIVE_IDLE || duty == 0)
     {
-        case DRIVE_IDLE:
-            drive_stop_raw();
-            Serial.println("DRIVE_IDLE");
-            break;
+        drive_stop_raw();
+        drive_state = DRIVE_IDLE;
+        return;
+    }
 
+    set_drive_power(true);
+
+    switch (state)
+    {
         case DRIVE_FORWARD:
-            drive_forward_raw();
-            Serial.printf("DRIVE_FORWARD @ %u%%\n", drive_speed_percent);
+            drive_forward_raw(duty);
             break;
 
         case DRIVE_BACKWARD:
-            drive_backward_raw();
-            Serial.printf("DRIVE_BACKWARD @ %u%%\n", drive_speed_percent);
+            drive_backward_raw(duty);
             break;
 
         case DRIVE_LEFT:
-            drive_left_raw();
-            Serial.printf("DRIVE_LEFT @ %u%%\n", drive_speed_percent);
+            drive_left_raw(duty);
             break;
 
         case DRIVE_RIGHT:
-            drive_right_raw();
-            Serial.printf("DRIVE_RIGHT @ %u%%\n", drive_speed_percent);
+            drive_right_raw(duty);
             break;
 
         default:
             drive_stop_raw();
             drive_state = DRIVE_IDLE;
-            Serial.println("DRIVE_DEFAULT_TO_IDLE");
             break;
     }
 }
 
-void apply_drive_state(DriveState new_state)
+bool is_opposite_drive_direction(DriveState old_state, DriveState new_state)
 {
-    bool reversing =
-        ((drive_state == DRIVE_FORWARD)  && (new_state == DRIVE_BACKWARD)) ||
-        ((drive_state == DRIVE_BACKWARD) && (new_state == DRIVE_FORWARD));
+    return
+        ((old_state == DRIVE_FORWARD)  && (new_state == DRIVE_BACKWARD)) ||
+        ((old_state == DRIVE_BACKWARD) && (new_state == DRIVE_FORWARD));
+}
 
-    if (reversing)
+void command_drive_state(DriveState new_state)
+{
+    if (new_state == DRIVE_IDLE)
     {
-        drive_stop_raw();
-        drive_state = DRIVE_IDLE;
+        commanded_drive_state = DRIVE_IDLE;
+        target_drive_duty = 0;
+        drive_interlock_active = false;
 
-        drive_interlock_active = true;
-        drive_interlock_start_ms = millis();
-        pending_drive_state = new_state;
-
-        Serial.println("DRIVE_INTERLOCK_50MS");
+        Serial.println("DRIVE_COMMAND_STOP_DECEL");
         return;
     }
 
-    apply_drive_state_immediate(new_state);
+    set_drive_power(true);
+
+    bool reversing =
+        is_opposite_drive_direction(commanded_drive_state, new_state) ||
+        is_opposite_drive_direction((DriveState)drive_state, new_state);
+
+    if (reversing)
+    {
+        commanded_drive_state = DRIVE_IDLE;
+        target_drive_duty = 0;
+
+        pending_drive_state = new_state;
+        drive_interlock_active = true;
+        drive_interlock_start_ms = 0;
+
+        Serial.println("DRIVE_REVERSAL_REQUEST_DECEL_FIRST");
+        return;
+    }
+
+    commanded_drive_state = new_state;
+    target_drive_duty = drive_duty;
+    drive_power_off_pending = false;
+
+    // Prevent initial lunge from stale duty.
+    // Starting from stop must always ramp up from zero.
+    if (drive_state == DRIVE_IDLE || current_drive_duty == 0)
+    {
+        current_drive_duty = 0;
+        last_drive_ramp_ms = millis();
+    }
+
+    // Safety clamp: never start above the requested target.
+    if (current_drive_duty > target_drive_duty)
+    {
+        current_drive_duty = target_drive_duty;
+    }
+
+    Serial.printf("DRIVE_COMMAND_%s target=%u\n", drive_state_to_str(new_state), target_drive_duty);
 }
 
-void update_drive_speed(uint8_t percent)
+void service_drive_ramp()
 {
-    if (percent > 100) percent = 100;
+    uint32_t now_ms = millis();
 
-    drive_speed_percent = percent;
-    drive_duty = speed_percent_to_duty(percent);
+    if ((uint32_t)(now_ms - last_drive_ramp_ms) < DRIVE_RAMP_INTERVAL_MS)
+        return;
 
-    Serial.printf("SPEED_UPDATED -> %u%% (duty=%u)\n", drive_speed_percent, drive_duty);
+    last_drive_ramp_ms = now_ms;
 
-    if (!drive_interlock_active)
+    if (current_drive_duty < target_drive_duty)
     {
-        apply_drive_state_immediate((DriveState)drive_state);
+        uint16_t next = current_drive_duty + DRIVE_ACCEL_STEP;
+        current_drive_duty = (next > target_drive_duty) ? target_drive_duty : (uint8_t)next;
     }
+    else if (current_drive_duty > target_drive_duty)
+    {
+        if (current_drive_duty > DRIVE_DECEL_STEP)
+            current_drive_duty -= DRIVE_DECEL_STEP;
+        else
+            current_drive_duty = 0;
+
+        if (current_drive_duty < target_drive_duty)
+            current_drive_duty = target_drive_duty;
+    }
+
+    if (current_drive_duty == 0)
+    {
+        apply_drive_output(DRIVE_IDLE, 0);
+
+        if (drive_interlock_active)
+        {
+            if (drive_interlock_start_ms == 0)
+            {
+                drive_interlock_start_ms = now_ms;
+                Serial.printf("DRIVE_BRAKE_HOLD_%luMS\n", (unsigned long)DRIVE_DIR_CHANGE_DELAY_MS);
+            }
+
+            if ((uint32_t)(now_ms - drive_interlock_start_ms) >= DRIVE_DIR_CHANGE_DELAY_MS)
+            {
+                drive_interlock_active = false;
+                commanded_drive_state = pending_drive_state;
+                target_drive_duty = drive_duty;
+                drive_power_off_pending = false;
+
+                current_drive_duty = 0;
+                last_drive_ramp_ms = millis();
+
+                set_drive_power(true);
+
+                Serial.printf("DRIVE_REVERSAL_APPLY_%s\n", drive_state_to_str(pending_drive_state));
+            }
+        }
+        else if (commanded_drive_state == DRIVE_IDLE)
+        {
+            request_drive_power_off_delay();
+        }
+
+        return;
+    }
+
+    apply_drive_output(commanded_drive_state, current_drive_duty);
+}
+
+void update_drive_speed(uint8_t received_percent)
+{
+    if (received_percent > 100) received_percent = 100;
+
+    // Invert Python speed.
+    // Example: Python sends 87, ESP32 uses 13.
+    uint8_t effective_percent = 100 - received_percent;
+
+    drive_speed_percent = effective_percent;
+    drive_duty = speed_percent_to_duty(effective_percent);
+
+    if (commanded_drive_state != DRIVE_IDLE && !drive_interlock_active)
+    {
+        target_drive_duty = drive_duty;
+
+        if (current_drive_duty > target_drive_duty)
+        {
+            current_drive_duty = target_drive_duty;
+        }
+    }
+
+    Serial.printf(
+        "SPEED_RX=%u -> EFFECTIVE=%u%% (target duty=%u)\n",
+        received_percent,
+        drive_speed_percent,
+        drive_duty
+    );
 }
 
 /* ================= STEPPER CONTROL ================= */
@@ -408,7 +600,14 @@ void refresh_watchdog()
 void stopAllMotion()
 {
     drive_interlock_active = false;
-    apply_drive_state_immediate(DRIVE_IDLE);
+    commanded_drive_state = DRIVE_IDLE;
+    pending_drive_state = DRIVE_IDLE;
+    target_drive_duty = 0;
+    current_drive_duty = 0;
+
+    apply_drive_output(DRIVE_IDLE, 0);
+    request_drive_power_off_delay();
+
     apply_stepper_state(STEPPER_IDLE);
 }
 
@@ -432,19 +631,19 @@ void apply_command(char cmd)
     switch (cmd)
     {
         case 'W':
-            apply_drive_state(DRIVE_FORWARD);
+            command_drive_state(DRIVE_FORWARD);
             break;
 
         case 'S':
-            apply_drive_state(DRIVE_BACKWARD);
+            command_drive_state(DRIVE_BACKWARD);
             break;
 
         case 'A':
-            apply_drive_state(DRIVE_LEFT);
+            command_drive_state(DRIVE_LEFT);
             break;
 
         case 'D':
-            apply_drive_state(DRIVE_RIGHT);
+            command_drive_state(DRIVE_RIGHT);
             break;
 
         case 'U':
@@ -460,8 +659,9 @@ void apply_command(char cmd)
             break;
 
         case 'X':
-            stopAllMotion();
-            Serial.println("STOP_ALL");
+            command_drive_state(DRIVE_IDLE);
+            apply_stepper_state(STEPPER_IDLE);
+            Serial.println("STOP_ALL_DECEL");
             break;
 
         default:
@@ -531,6 +731,28 @@ void handle_speed()
     server.send(200, "text/plain", build_telemetry_string());
 }
 
+void handle_heartbeat()
+{
+    if (!server.hasArg("plain"))
+    {
+        server.send(400, "text/plain", "ERROR:NO_BODY");
+        return;
+    }
+
+    String body = server.arg("plain");
+    body.trim();
+    body.toUpperCase();
+
+    if (body != "ALIVE")
+    {
+        server.send(400, "text/plain", "ERROR:INVALID_HEARTBEAT");
+        return;
+    }
+
+    refresh_watchdog();
+    server.send(200, "text/plain", build_telemetry_string());
+}
+
 void handle_status()
 {
     server.send(200, "text/plain", build_telemetry_string());
@@ -557,11 +779,14 @@ void gpio_init_all()
     gpio_set_direction(LBRAKE_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(RBRAKE_PIN, GPIO_MODE_OUTPUT);
 
+    gpio_set_direction(DRIVE_POWER_EN_PIN, GPIO_MODE_OUTPUT);
+
     pin_write(STEP_PIN, 0);
     pin_write(DIR_PIN, 0);
 
     stepper_set_microstep(STEP_MS1, STEP_MS2, STEP_MS3);
 
+    set_drive_power(false);
     drive_stop_raw();
     stepper_enable(false);
 }
@@ -588,10 +813,11 @@ void wifi_init()
 
 void server_init()
 {
-    server.on("/api/ping",   HTTP_GET,  handle_ping);
-    server.on("/api/cmd",    HTTP_POST, handle_cmd);
-    server.on("/api/speed",  HTTP_POST, handle_speed);
-    server.on("/api/status", HTTP_GET,  handle_status);
+    server.on("/api/ping",      HTTP_GET,  handle_ping);
+    server.on("/api/cmd",       HTTP_POST, handle_cmd);
+    server.on("/api/speed",     HTTP_POST, handle_speed);
+    server.on("/api/heartbeat", HTTP_POST, handle_heartbeat);
+    server.on("/api/status",    HTTP_GET,  handle_status);
     server.onNotFound(handle_not_found);
 
     server.begin();
@@ -612,7 +838,13 @@ void setup()
     drive_duty = speed_percent_to_duty(drive_speed_percent);
     stepper_set_rate_hz(STEPPER_PULSE_HZ);
 
-    apply_drive_state_immediate(DRIVE_IDLE);
+    commanded_drive_state = DRIVE_IDLE;
+    drive_state = DRIVE_IDLE;
+    current_drive_duty = 0;
+    target_drive_duty = 0;
+
+    apply_drive_output(DRIVE_IDLE, 0);
+    set_drive_power(false);
     apply_stepper_state(STEPPER_IDLE);
 
     lastPacketTime = millis();
@@ -628,17 +860,8 @@ void loop()
     server.handleClient();
 
     service_stepper();
-
-    if (drive_interlock_active)
-    {
-        uint32_t now_ms = millis();
-
-        if ((uint32_t)(now_ms - drive_interlock_start_ms) >= DRIVE_DIR_CHANGE_DELAY_MS)
-        {
-            drive_interlock_active = false;
-            apply_drive_state_immediate(pending_drive_state);
-        }
-    }
+    service_drive_ramp();
+    service_drive_power_off();
 
     uint32_t now_ms = millis();
 
