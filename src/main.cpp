@@ -85,7 +85,7 @@ volatile DriveState   drive_state   = DRIVE_IDLE;
 volatile StepperState stepper_state = STEPPER_IDLE;
 
 volatile uint8_t drive_speed_percent = 50;
-volatile uint8_t drive_duty = 127;
+volatile uint8_t drive_duty = 20;
 
 /* ================= WATCHDOG STATE ================= */
 
