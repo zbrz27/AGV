@@ -3,8 +3,9 @@
 #if USING_NATE_DRIVE_MOTOR_CONTROL
 
 /* Internal Logic Constants */
-constexpr uint8_t DRIVE_ACCEL_STEP = 2;
-constexpr uint8_t DRIVE_DECEL_STEP = 4;
+#define MOTOR_STEP_RATE 2
+constexpr uint8_t DRIVE_ACCEL_STEP = MOTOR_STEP_RATE;
+constexpr uint8_t DRIVE_DECEL_STEP = MOTOR_STEP_RATE;
 constexpr uint32_t DRIVE_DIR_CHANGE_DELAY_MS = 150;
 constexpr uint32_t DRIVE_POWER_OFF_DELAY_MS = 150;
 
@@ -13,16 +14,18 @@ portMUX_TYPE stepperMux = portMUX_INITIALIZER_UNLOCKED;
 volatile DriveState drive_state = DRIVE_IDLE;                   
 
 // wheels are relative to stepper shaft direction. Shaft direction = left
-wheel_direction_t left_wheel = 0;                               // init left wheel to stop state
-wheel_direction_t right_wheel = 0;                              // init right wheel to stop state
+wheel_direction_t left_wheel = NONE;                               // init left wheel to stop state
+wheel_direction_t right_wheel = NONE;                              // init right wheel to stop state
 
 volatile StepperState stepper_state = STEPPER_IDLE;
 DriveState commanded_drive_state = DRIVE_IDLE;                  
-DriveState pending_drive_state = DRIVE_IDLE;                   
+DriveState pending_drive_state = DRIVE_IDLE;     
+DriveState current_drive_state = DRIVE_IDLE;              
 
 uint8_t current_drive_duty = 0;
 uint8_t target_drive_duty = 0;
 uint8_t drive_duty_pref = 20; 
+uint8_t python_requested_duty = 0;
 
 uint32_t last_drive_ramp_ms = 0;
 uint32_t last_step_toggle_us = 0;
@@ -53,14 +56,16 @@ void set_drive_power(bool enabled) {
     return;
 }
 
-void apply_drive_output(DriveState state, uint8_t duty) {
+static void apply_drive_output(DriveState state, uint8_t duty) {
     static bool ldir;
     static bool rdir;
 
     drive_state = state;
     if (state == DRIVE_IDLE || duty == 0) {
-        ledcWrite(LPWM_CH, 0); ledcWrite(RPWM_CH, 0);
-        pin_write(LBRAKE_PIN, true); pin_write(RBRAKE_PIN, true);
+        ledcWrite(LPWM_CH, 0); 
+        ledcWrite(RPWM_CH, 0);
+        pin_write(LBRAKE_PIN, true); 
+        pin_write(RBRAKE_PIN, true);
         return;
     }
 
@@ -90,17 +95,34 @@ void robot_init() {
     lastPacketTime = millis();
 }
 
-void service_robot() {
-    uint32_t now_ms = millis(); // Check how much time has passed / get current time
-    
-    // Ramp Logic
-    if ((now_ms - last_drive_ramp_ms) >= DRIVE_RAMP_INTERVAL_MS) {
-        if (current_drive_duty < target_drive_duty) current_drive_duty += DRIVE_ACCEL_STEP;
-        else if (current_drive_duty > target_drive_duty) current_drive_duty -= DRIVE_DECEL_STEP;
-        last_drive_ramp_ms = now_ms;
-        apply_drive_output(commanded_drive_state, current_drive_duty);
-    }
 
+void service_robot() {
+    uint32_t now_ms = millis();
+    
+    // RAMP SPEED CONTROLLER
+    if (now_ms - last_drive_ramp_ms >= DRIVE_RAMP_INTERVAL_MS) {
+        // Standard Ramping Logic
+        if (current_drive_duty < target_drive_duty) {
+            current_drive_duty += DRIVE_ACCEL_STEP;
+        } else if (current_drive_duty > target_drive_duty) {
+            current_drive_duty -= DRIVE_DECEL_STEP;
+        }
+        
+// Check if we have successfully slewed down to zero during a reversal
+        if (drive_interlock_active && current_drive_duty == 0) {
+            // Now we can safely flip the H-Bridge direction
+            commanded_drive_state = pending_drive_state;
+
+            target_drive_duty = python_requested_duty;
+            
+            drive_interlock_active = false; // Clear the flag
+        }
+
+        last_drive_ramp_ms = now_ms;
+        
+        // Apply the updated duty and the (possibly updated) direction
+        apply_drive_output(commanded_drive_state, current_drive_duty);
+    }   
     // Watchdog
     if (!watchdog_tripped && (now_ms - lastPacketTime > WATCHDOG_TIMEOUT_MS)) {
         stopAllMotion();
@@ -126,26 +148,38 @@ bool is_watchdog_tripped() {
 
 void update_drive_speed(uint8_t received_percent) {
     uint8_t effective = 100 - received_percent;
-    target_drive_duty = (uint8_t)((255UL * effective) / 100UL);
+    python_requested_duty = (uint8_t)((255UL * effective) / 100UL); // Store the "Goal"
+
+    // Only update active target if we aren't busy braking for a direction change
+    if (!drive_interlock_active) {
+        target_drive_duty = python_requested_duty;
+    }
 }
 
 void apply_command(char cmd) {
     refresh_watchdog();
-    switch (cmd) {
-        case 'W': 
-            commanded_drive_state = DRIVE_FORWARD; 
-            break;
-        case 'S': 
-            commanded_drive_state = DRIVE_BACKWARD; 
-            break;
-        case 'X': 
-            stopAllMotion(); 
-            break;
-        default:
+    DriveState next_state = DRIVE_IDLE;
 
-            break;
-        // Add A, D, U, J, K cases as per original
+    // Map characters to states
+    if (cmd == 'W') next_state = DRIVE_FORWARD;
+    else if (cmd == 'S') next_state = DRIVE_BACKWARD;
+    else if (cmd == 'X') { stopAllMotion(); return; }
+
+    // Check for direction change
+    if (next_state != commanded_drive_state && commanded_drive_state != DRIVE_IDLE) {
+        // Reversal detected: Slew to zero first
+        target_drive_duty = 0;
+        pending_drive_state = next_state;
+        drive_interlock_active = true; 
+    } else {
+        // Normal start or same-direction speed update
+        commanded_drive_state = next_state;
+        // target_drive_duty remains at its current set point
     }
+}
+
+uint8_t determine_drive_state(wheel_direction_t wheel){
+    return 0;
 }
 
 String build_telemetry_string() {
