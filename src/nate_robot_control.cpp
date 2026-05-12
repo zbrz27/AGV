@@ -1,7 +1,7 @@
 #include "robot_config.h"
 
+#if USING_NATE_DRIVE_MOTOR_CONTROL
 
-#ifndef USING_NATE_DRIVE_MOTOR_CONTROL
 /* Internal Logic Constants */
 constexpr uint8_t DRIVE_ACCEL_STEP = 2;
 constexpr uint8_t DRIVE_DECEL_STEP = 4;

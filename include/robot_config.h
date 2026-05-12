@@ -9,6 +9,9 @@
 extern const char* AP_SSID;
 extern const char* AP_PASS;
 
+/* =========== NATE'S REWORK ================ */
+#define USING_NATE_DRIVE_MOTOR_CONTROL true
+
 /* ================= PIN DEFINITIONS ================= */
 constexpr gpio_num_t STEP_PIN = GPIO_NUM_18;
 constexpr gpio_num_t DIR_PIN  = GPIO_NUM_19;
@@ -34,8 +37,25 @@ constexpr uint32_t WATCHDOG_TIMEOUT_MS = 800;
 constexpr uint32_t DRIVE_RAMP_INTERVAL_MS = 20;
 
 /* ================= ENUMS & STATES ================= */
-enum DriveState { DRIVE_IDLE = 0, DRIVE_FORWARD, DRIVE_BACKWARD, DRIVE_LEFT, DRIVE_RIGHT };
-enum StepperState { STEPPER_IDLE = 0, STEPPER_CW, STEPPER_CCW };
+enum DriveState { 
+    DRIVE_IDLE = 0, 
+    DRIVE_FORWARD, 
+    DRIVE_BACKWARD, 
+    DRIVE_LEFT, 
+    DRIVE_RIGHT 
+};
+
+enum wheel_direction_t {
+    NONE = 0,
+    CW,
+    CCW
+};
+
+enum StepperState { 
+    STEPPER_IDLE = 0, 
+    STEPPER_CW, 
+    STEPPER_CCW 
+};
 
 /* ================= FUNCTION PROTOTYPES ================= */
 void robot_init();
