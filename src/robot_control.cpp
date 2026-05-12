@@ -13,21 +13,21 @@ volatile StepperState stepper_state = STEPPER_IDLE;
 DriveState commanded_drive_state = DRIVE_IDLE;
 DriveState pending_drive_state = DRIVE_IDLE;
 
-extern uint8_t current_drive_duty = 0;
-extern uint8_t target_drive_duty = 0;
-extern uint8_t drive_duty_pref = 20; 
+uint8_t current_drive_duty = 0;
+uint8_t target_drive_duty = 0;
+uint8_t drive_duty_pref = 20; 
 
-extern uint32_t last_drive_ramp_ms = 0;
-extern uint32_t last_step_toggle_us = 0;
-extern uint32_t lastPacketTime = 0;
-extern uint32_t drive_interlock_start_ms = 0;
-extern uint32_t drive_power_off_start_ms = 0;
-extern uint32_t stepper_half_period_us = 2500;
+uint32_t last_drive_ramp_ms = 0;
+uint32_t last_step_toggle_us = 0;
+uint32_t lastPacketTime = 0;
+uint32_t drive_interlock_start_ms = 0;
+uint32_t drive_power_off_start_ms = 0;
+uint32_t stepper_half_period_us = 2500;
 
-extern bool watchdog_tripped = false;
-extern bool drive_interlock_active = false;
-extern bool drive_power_enabled = false;
-extern bool drive_power_off_pending = false;
+bool watchdog_tripped = false;
+bool drive_interlock_active = false;
+bool drive_power_enabled = false;
+bool drive_power_off_pending = false;
 volatile bool stepper_enabled = false;
 volatile bool step_pin_state = false;
 
