@@ -13,7 +13,7 @@ volatile StepperState stepper_state = STEPPER_IDLE;
 DriveState commanded_drive_state = DRIVE_IDLE;
 DriveState pending_drive_state = DRIVE_IDLE;
 
-extern uint8_t current_drive_duty =s 0;
+extern uint8_t current_drive_duty = 0;
 extern uint8_t target_drive_duty = 0;
 extern uint8_t drive_duty_pref = 20; 
 
